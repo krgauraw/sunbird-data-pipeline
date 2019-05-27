@@ -2,78 +2,63 @@ package org.ekstep.ep.samza.service;
 
 import static java.text.MessageFormat.format;
 
+import org.ekstep.ep.samza.core.JobMetrics;
 import org.ekstep.ep.samza.core.Logger;
 import org.ekstep.ep.samza.domain.Event;
 import org.ekstep.ep.samza.domain.Location;
 import com.google.gson.JsonSyntaxException;
-import org.ekstep.ep.samza.engine.LocationEngine;
 import org.ekstep.ep.samza.task.TelemetryLocationUpdaterConfig;
 import org.ekstep.ep.samza.task.TelemetryLocationUpdaterSink;
 import org.ekstep.ep.samza.task.TelemetryLocationUpdaterSource;
-
-import java.io.IOException;
-
+import org.ekstep.ep.samza.util.DeviceLocationCache;
 
 public class TelemetryLocationUpdaterService {
 	
 	private static Logger LOGGER = new Logger(TelemetryLocationUpdaterService.class);
-	private final TelemetryLocationUpdaterConfig config;
-	private LocationEngine locationEngine;
+	private DeviceLocationCache deviceLocationCache;
+	private JobMetrics metrics;
 
 
-	public TelemetryLocationUpdaterService(TelemetryLocationUpdaterConfig config, LocationEngine locationEngine) {
-		this.config = config;
-		this.locationEngine = locationEngine;
+	public TelemetryLocationUpdaterService(DeviceLocationCache deviceLocationCache, JobMetrics metrics) {
+		this.deviceLocationCache = deviceLocationCache;
+		this.metrics = metrics;
 	}
 
 	public void process(TelemetryLocationUpdaterSource source, TelemetryLocationUpdaterSink sink) {
-		Event event = null;
-		Location location;
 		try {
-			event = source.getEvent();
-			String did = event.did();
-			String channel = event.channel();
-			if (did != null && !did.isEmpty()) {
-				location = locationEngine.locationCache().getLocationForDeviceId(event.did(), channel);
-
-				if (location != null) {
-					event = updateEvent(event, location, true);
-				} else {
-					// add default location from ORG search API
-					event = updateEventWithLocationFromChannel(event);
-				}
-			} else {
-				event = updateEventWithLocationFromChannel(event);
-			}
+			Event event = source.getEvent();
+			sink.setMetricsOffset(source.getSystemStreamPartition(), source.getOffset());
+			// Add device location details to the event
+			updateEventWithIPLocation(event);
 			sink.toSuccessTopic(event);
-		} catch(JsonSyntaxException e){
-            LOGGER.error(null, "INVALID EVENT: " + source.getMessage());
-            sink.toMalformedTopic(source.getMessage());
-        } catch (Exception e) {
-			LOGGER.error(null,
-					format("EXCEPTION. PASSING EVENT THROUGH AND ADDING IT TO EXCEPTION TOPIC. EVENT: {0}, EXCEPTION:",
-							event),
-					e);
-			sink.toErrorTopic(event, e.getMessage());
+		} catch (JsonSyntaxException e) {
+			LOGGER.error(null, "INVALID EVENT: " + source.getMessage());
+			sink.toMalformedTopic(source.getMessage());
 		}
 	}
 
-	private Event updateEventWithLocationFromChannel(Event event) throws IOException {
-		Location location = locationEngine.getLocation(event.channel());
-		if (location != null && !location.getState().isEmpty()) {
-			event = updateEvent(event, location, true);
+	private Event updateEventWithIPLocation(Event event) {
+		String did = event.did();
+		Location location = null;
+		if (did != null && !did.isEmpty()) {
+			location = deviceLocationCache.getLocationForDeviceId(event.did());
+			updateEvent(event, location);
+			metrics.incProcessedMessageCount();
 		} else {
-			// add empty location
-			location = new Location("", "", "", "", "");
-			event = updateEvent(event, location, false);
+			event = updateEvent(event, location);
+			metrics.incUnprocessedMessageCount();
 		}
 		return event;
 	}
 
-	public Event updateEvent(Event event, Location location, Boolean ldataFlag) {
-		event.addLocation(location);
+	public Event updateEvent(Event event, Location location) {
 		event.removeEdataLoc();
-		event.setFlag(TelemetryLocationUpdaterConfig.locationJobFlag(), ldataFlag);
+		if (location != null && location.isLocationResolved()) {
+			event.addLocation(location);
+			event.setFlag(TelemetryLocationUpdaterConfig.getDeviceLocationJobFlag(), true);
+		} else {
+			event.setFlag(TelemetryLocationUpdaterConfig.getDeviceLocationJobFlag(), false);
+		}
 		return event;
 	}
 }
